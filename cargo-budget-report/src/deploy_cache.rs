@@ -152,11 +152,15 @@ impl DeployCache {
 
         // Read → parse → version-check, collapsing every failure to `None` so
         // a cold cache is returned instead of propagating an error.
-        let file = std::fs::read_to_string(&path)
+        let mut file = std::fs::read_to_string(&path)
             .ok()
             .and_then(|text| toml::from_str::<CacheFile>(&text).ok())
             .filter(|f| f.version == CACHE_VERSION)
             .unwrap_or_default();
+
+        for entry in &mut file.entries {
+            entry.wasm_sha256.make_ascii_lowercase();
+        }
 
         DeployCache {
             path,
@@ -172,10 +176,15 @@ impl DeployCache {
     /// wasm hash, a different network, or a different source account all
     /// produce a miss, forcing a fresh deployment.
     pub fn get(&self, wasm_sha256: &str, network: &str, source: &str) -> Option<&str> {
+        let normalized_sha256 = wasm_sha256.to_ascii_lowercase();
         self.file
             .entries
             .iter()
-            .find(|e| e.wasm_sha256 == wasm_sha256 && e.network == network && e.source == source)
+            .find(|e| {
+                e.wasm_sha256.eq_ignore_ascii_case(&normalized_sha256)
+                    && e.network == network
+                    && e.source == source
+            })
             .map(|e| e.contract_id.as_str())
     }
 
@@ -183,9 +192,10 @@ impl DeployCache {
     /// same `(package, network, source)` triple.
     ///
     /// When the wasm is rebuilt, `wasm_sha256` changes and the old entry for
-    /// that package on that network/source is now stale — retaining it would
+    /// that package on that network/source is now stale - retaining it would
     /// waste space and could never be matched by [`get`](Self::get) anyway
-    /// (because the hash would not match).  Evicting it keeps the file tidy.
+    /// (because the hash would not match). Evicting it keeps the file tidy.
+    /// `wasm_sha256` is always stored in canonical lowercase hex.
     pub fn put(
         &mut self,
         package: &str,
@@ -195,15 +205,15 @@ impl DeployCache {
         contract_id: &str,
     ) {
         // Remove any existing entry for this (package, network, source) before
-        // inserting the new one.  This covers both the "first deployment" and
-        // the "rebuild → new hash" cases with the same code path.
+        // inserting the new one. This covers both the "first deployment" and
+        // the "rebuild -> new hash" cases with the same code path.
         self.file
             .entries
             .retain(|e| !(e.package == package && e.network == network && e.source == source));
 
         self.file.entries.push(CacheEntry {
             package: package.to_string(),
-            wasm_sha256: wasm_sha256.to_string(),
+            wasm_sha256: wasm_sha256.to_ascii_lowercase(),
             network: network.to_string(),
             source: source.to_string(),
             contract_id: contract_id.to_string(),
@@ -379,5 +389,67 @@ mod tests {
         );
         assert_eq!(hex_sha256(b"abc").len(), 64);
         assert_ne!(hex_sha256(b"abc"), hex_sha256(b"abd"));
+    }
+
+    #[test]
+    fn get_matches_uppercase_lowercase_and_mixed_case_queries() {
+        let dir = tempdir().unwrap();
+        let mut cache = DeployCache::load(dir.path());
+        let lower = "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9";
+        let upper = "B94D27B9934D3E08A52E52D7DA7DABFAC484EFE37A5380EE9088F7ACE2EFCDE9";
+        let mixed = "B94d27B9934d3E08a52E52d7Da7dAbFaC484eFe37A5380eE9088F7aCe2EfCdE9";
+
+        cache.put("pkg", lower, "testnet", "alice", ID_A);
+        assert_eq!(cache.get(lower, "testnet", "alice"), Some(ID_A));
+        assert_eq!(cache.get(upper, "testnet", "alice"), Some(ID_A));
+        assert_eq!(cache.get(mixed, "testnet", "alice"), Some(ID_A));
+
+        cache.save().unwrap();
+        let reloaded = DeployCache::load(dir.path());
+        assert_eq!(reloaded.get(lower, "testnet", "alice"), Some(ID_A));
+        assert_eq!(reloaded.get(upper, "testnet", "alice"), Some(ID_A));
+        assert_eq!(reloaded.get(mixed, "testnet", "alice"), Some(ID_A));
+    }
+
+    #[test]
+    fn put_stores_canonical_lowercase_hex_on_disk() {
+        let dir = tempdir().unwrap();
+        let mut cache = DeployCache::load(dir.path());
+        let upper = "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855";
+        let lower = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let mixed = "e3B0c44298Fc1c149aFbF4c8996fB92427Ae41E4649b934cA495991B7852b855";
+
+        cache.put("pkg-upper", upper, "testnet", "alice", ID_A);
+        cache.put("pkg-mixed", mixed, "testnet", "alice", ID_B);
+        cache.save().unwrap();
+
+        let saved_toml = std::fs::read_to_string(dir.path().join(CACHE_FILE)).unwrap();
+        assert!(saved_toml.contains(&format!("wasm_sha256 = \"{lower}\"")));
+        assert!(!saved_toml.contains(upper));
+        assert!(!saved_toml.contains(mixed));
+
+        let reloaded = DeployCache::load(dir.path());
+        assert_eq!(reloaded.get(lower, "testnet", "alice"), Some(ID_A));
+        assert_eq!(reloaded.get(upper, "testnet", "alice"), Some(ID_A));
+        assert_eq!(reloaded.get(mixed, "testnet", "alice"), Some(ID_A));
+    }
+
+    #[test]
+    fn load_normalizes_uppercase_and_mixed_case_entries_from_disk() {
+        let dir = tempdir().unwrap();
+        let raw_toml = format!(
+            "version = {CACHE_VERSION}\n\n[[entry]]\npackage = \"pkg-a\"\nwasm_sha256 = \"ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789\"\nnetwork = \"testnet\"\nsource = \"alice\"\ncontract_id = \"{ID_A}\"\n\n[[entry]]\npackage = \"pkg-b\"\nwasm_sha256 = \"AbCdEf0123456789aBcDeF0123456789AbCdEf0123456789aBcDeF0123456789\"\nnetwork = \"testnet\"\nsource = \"bob\"\ncontract_id = \"{ID_B}\"\n"
+        );
+        std::fs::write(dir.path().join(CACHE_FILE), raw_toml).unwrap();
+
+        let cache = DeployCache::load(dir.path());
+        let canonical = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        let upper = "ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789";
+        let mixed = "aBcDeF0123456789AbCdEf0123456789aBcDeF0123456789AbCdEf0123456789";
+
+        assert_eq!(cache.get(canonical, "testnet", "alice"), Some(ID_A));
+        assert_eq!(cache.get(upper, "testnet", "alice"), Some(ID_A));
+        assert_eq!(cache.get(mixed, "testnet", "alice"), Some(ID_A));
+        assert_eq!(cache.get(canonical, "testnet", "bob"), Some(ID_B));
     }
 }
